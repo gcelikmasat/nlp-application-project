@@ -3,7 +3,8 @@ import torch
 from torch import nn
 from torchvision.models import resnet152
 from transformers import BertModel, BertPreTrainedModel
-from utils import ContextAwareGate, DynamicAttentionModule
+from bert.utils import ContextAwareGate, DynamicAttentionModule
+
 
 
 class BertCrossAttention(nn.Module):
@@ -27,8 +28,9 @@ class MTCCMBertForMMTokenClassificationCRF(BertPreTrainedModel):
     def __init__(self, config, num_labels, add_context_aware_gate=False, use_dynamic_cross_modal_fusion=False):
         super().__init__(config)
         self.num_labels = num_labels
-        self.bert = BertModel(config)
-        self.resnet = resnet152(pretrained=True)
+        self.bert = BertModel.from_pretrained('bert/')
+        self.resnet = resnet152()
+        self.resnet.load_state_dict(torch.load('resnet/resnet152-394f9c45.pth'))
         self.resnet.fc = nn.Identity()  # Adapt ResNet to remove the final fully connected layer
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)

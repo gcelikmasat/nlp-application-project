@@ -1,41 +1,172 @@
+import gc
+import os
+import torch
+from torch import nn, optim
+from torchvision.models import resnet152
+from transformers import BertModel, BertTokenizer
 import os
 import torchvision.transforms
 import torch
-from transformers import BertTokenizer, BertConfig
+from transformers import BertTokenizer, BertConfig, BertPreTrainedModel, BertForTokenClassification
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from sklearn.metrics import f1_score
 from torch.optim import Adam
 from transformers import get_linear_schedule_with_warmup
 from torch.nn.utils.rnn import pad_sequence
+from torchcrf import CRF
+from tqdm import tqdm
 
 from bert.my_bert_model import MTCCMBertForMMTokenClassificationCRF
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+MAX_LENGTH = 128
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Using", device)
+
+model_types = ["model_with_gate", "model_with_fusion", "base_model"]
+
+
+# model_types = ["model_with_all", "model_with_gate", "model_with_fusion", "base_model"]
+
+
+def extract_labels(data_folder):
+    labels_set = set()
+
+    for filename in os.listdir(data_folder):
+        if filename.endswith(".txt"):
+            file_path = os.path.join(data_folder, filename)
+            with open(file_path, "r", encoding="utf8") as file:
+                for line in file:
+                    if line.strip() and not line.startswith("IMGID:") and line != "\n":
+                        parts = line.strip().split('\t')
+                        if len(parts) == 2:
+                            label = parts[1]
+                            labels_set.add(label)
+
+    return labels_set
+
+
+def create_labels_dict(labels_set):
+    label2id = {label: idx for idx, label in enumerate(sorted(labels_set))}
+    id2label = {idx: label for label, idx in label2id.items()}
+
+    return label2id, id2label
+
+
+class TwitterDataset(Dataset):
+    def __init__(self, data_folder, img_folder, tokenizer, transform, file_name, label2id, id2label):
+        super().__init__()
+        self.data_lines = []
+        self.img_folder = img_folder
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.label2id = label2id
+        self.id2label = id2label
+
+        # Load data from the specified file
+        file_path = os.path.join(data_folder, file_name)
+        with open(file_path, 'r', encoding="utf8") as file:
+            img_id = None
+            text = []
+            labels = []
+
+            # counter = 0
+            for line in file:
+                # if counter == 100:
+                # break
+                if line.strip() == '' and img_id is not None:  # save previous instance
+                    try:
+                        image_path = os.path.join(self.img_folder, img_id)
+
+                        test_image = Image.open(image_path).convert("RGB")
+                        self.data_lines.append((img_id, text, labels))
+                    except:
+                        print("Skipping corrupted image")
+
+                    finally:
+                        img_id = None  # Reset for the next image
+                        text = []
+                        labels = []
+
+                elif line.startswith('IMGID:'):
+                    img_id = line.strip().split(':')[1] + '.jpg'  # New image id
+                else:
+                    parts = line.strip().split('\t')
+                    if len(parts) == 2:
+                        text.append(parts[0])
+                        labels.append(parts[1])
+
+                # counter+=1
+
+            # Save last instance if not empty
+            if img_id is not None:
+                img_path = os.path.join(self.img_folder, img_id)
+                try:
+                    test_image = Image.open(image_path).convert("RGB")
+                    self.data_lines.append((img_id, text, labels))
+
+                except:
+                    print("Skipping again corrupted images !!")
+
+    def __len__(self):
+        return len(self.data_lines)
+
+    def __getitem__(self, idx):
+        img_id, text, labels = self.data_lines[idx]
+        image_path = os.path.join(self.img_folder, img_id)
+        image = Image.open(image_path).convert('RGB')
+        text = ' '.join(text)
+        labels = [self.label_to_idx(label, self.label2id) for label in labels]  # Convert labels to indices
+
+        inputs = self.tokenizer(text, padding='max_length', max_length=MAX_LENGTH, truncation=True, return_tensors="pt")
+        image = self.transform(image)
+        labels = torch.tensor(labels, dtype=torch.long)
+
+        return inputs.input_ids.squeeze(0), inputs.attention_mask.squeeze(0), image, labels
+
+    @staticmethod
+    def label_to_idx(label, label_map):
+        # Define your label to index mapping based on your dataset's labels
+        try:
+            result = label_map[label]  # Convert unrecognized labels to 'O'
+        except:
+            result = 0
+
+        return result
 
 def collate_fn(batch):
     input_ids, attention_masks, images, labels = zip(*batch)
 
-    # Pad the sequences
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)
+    input_ids = pad_sequence([torch.tensor(ids)[:MAX_LENGTH] for ids in input_ids], batch_first=True, padding_value=0)
+    attention_masks = pad_sequence([torch.tensor(mask)[:MAX_LENGTH] for mask in attention_masks], batch_first=True,
+                                   padding_value=0)
 
     # Ensure the first timestep of each mask is on
     attention_masks[:, 0] = 1
 
     # Stack images and pad labels
     images = torch.stack(images)
-    labels = pad_sequence(labels, batch_first=True, padding_value=-100)  # Assuming -100 is your ignore index for labels
+    labels = pad_sequence([torch.tensor(label)[:MAX_LENGTH] for label in labels], batch_first=True,
+                          padding_value=-100)  # Assuming -100 is your ignore index for labels
 
     return input_ids, attention_masks, images, labels
 
 
 def train_model(model, train_loader, val_loader, optimizer, scheduler, num_epochs=10):
     best_f1 = 0.0
+    model.to(device)
 
     for epoch in range(num_epochs):
+        print("Training for epoch ", str(epoch))
         model.train()
         total_loss = 0
-        for inputs, masks, images, labels in train_loader:
+        train_progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False)
+
+        for inputs, masks, images, labels in train_progress_bar:
             optimizer.zero_grad()
             loss = model(inputs, masks, images, labels)
             loss.backward()
@@ -49,11 +180,17 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, num_epoch
         print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss}, Val Loss: {val_loss}, Val F1: {val_f1}")
 
         # Save the model if the validation F1 score is the best we've seen so far.
-        save_path = "output/epoch_" + str(epoch+1) + "_valf1_" + str(val_f1) + ".pth"
+        save_path = "/content/output/epoch_" + str(epoch + 1) + "_valf1_" + str(val_f1)
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        save_path = save_path + "/model.pth"
+        torch.save(model.state_dict(), save_path)
+        print("Saved best model")
+
         if val_f1 > best_f1:
             best_f1 = val_f1
-            torch.save(model.state_dict(), save_path)
-            print("Saved best model")
+            print("Validation improved: ", str(best_f1))
 
 
 def evaluate_model(model, data_loader):
@@ -62,118 +199,125 @@ def evaluate_model(model, data_loader):
     all_preds = []
     all_labels = []
     with torch.no_grad():
-        for inputs, masks, images, labels in data_loader:
-            loss = model(inputs, masks, images, labels)
+        validation_progress_bar = tqdm(data_loader, desc='Validating', leave=False)
+
+        for inputs, masks, images, labels in validation_progress_bar:
+            loss = model(inputs.to(device), masks.to(device), images.to(device), labels.to(device))
             total_loss += loss.item()
-            predictions = model(inputs, masks, images)  # Decoding without labels returns predictions
-            all_preds.extend([item for sublist in predictions for item in sublist])
-            all_labels.extend(labels.view(-1).cpu().numpy())
 
-    avg_loss = total_loss / len(data_loader)
-    f1 = f1_score(all_labels, all_preds, average='macro')  # Calculate macro F1 Score
-    return avg_loss, f1
+            # Get predictions and ensure they match label lengths for comparison
+            predictions = model(inputs.to(device), masks.to(device),
+                                images.to(device))  # Assuming returns a list of lists for each batch
 
+            # Process each batch item individually
+            for idx, (pred, label) in enumerate(zip(predictions, labels)):
+                label = label.cpu().numpy()
+                valid_length = len(label[label != -100])  # Length without padding
 
-class TwitterDataset(Dataset):
-    def __init__(self, data_folder, img_folder, tokenizer, transform, file_name):
-        super().__init__()
-        self.data_lines = []
-        self.img_folder = img_folder
-        self.tokenizer = tokenizer
-        self.transform = transform
+                # Adjust predictions to match the valid length of labels
+                pred = pred[:valid_length]  # Trim predictions to match the labels' valid length
 
-        # Load data from the specified file
-        file_path = os.path.join(data_folder, file_name)
-        with open(file_path, 'r', encoding="utf8") as file:
-            img_id = None
-            text = []
-            labels = []
+                all_preds.extend(pred)
+                all_labels.extend(label[:valid_length])  # Only consider valid label parts
 
-            for line in file:
-                if line.strip() == '' and img_id is not None:  # save previous instance
-                    self.data_lines.append((img_id, text, labels))
-                    img_id = None  # Reset for the next image
-                    text = []
-                    labels = []
-                elif line.startswith('IMGID:'):
-                    img_id = line.strip().split(':')[1] + '.jpg'  # New image id
-                else:
-                    parts = line.strip().split('\t')
-                    if len(parts) == 2:
-                        text.append(parts[0])
-                        labels.append(parts[1])
-
-            # Save last instance if not empty
-            if img_id is not None:
-                self.data_lines.append((img_id, text, labels))
-
-    def __len__(self):
-        return len(self.data_lines)
-
-    def __getitem__(self, idx):
-        img_id, text, labels = self.data_lines[idx]
-        image_path = os.path.join(self.img_folder, img_id)
-        image = Image.open(image_path).convert('RGB')
-        text = ' '.join(text)
-        labels = [self.label_to_idx(label) for label in labels]  # Convert labels to indices
-
-        inputs = self.tokenizer(text, padding='max_length', max_length=128, truncation=True,return_tensors="pt")
-        image = self.transform(image)
-        labels = torch.tensor(labels, dtype=torch.long)
-
-        return inputs.input_ids.squeeze(0), inputs.attention_mask.squeeze(0), image, labels
-
-    @staticmethod
-    def label_to_idx(label):
-        # Define your label to index mapping based on your dataset's labels
-        label_map = {
-            'O': 0,
-            'B-LOC': 1, 'I-LOC': 2,
-            'B-PER': 3, 'I-PER': 4,
-            'B-ORG': 5, 'I-ORG': 6
-        }
-        return label_map.get(label, 0)  # Convert unrecognized labels to 'O'
+    # Calculate F1 Score excluding any padded parts of labels
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    print(f"F1 Score: {f1}")
+    return total_loss / len(data_loader), f1
 
 
 def main():
-    data_folder = 'data/twitter2015'  # Update accordingly
-    img_folder = 'data/twitter2015_images'  # Update accordingly
+    for model_type in model_types:
+        data_folder = 'twitter2015'  # Update accordingly
+        img_folder = 'twitter2015_images'  # Update accordingly
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.Resize((224, 224)),
-        torchvision.transforms.ToTensor(),
-    ])
+        labels_set = extract_labels(data_folder)
+        label2id, id2label = create_labels_dict(labels_set)
 
-    train_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'train.txt')
-    val_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'valid.txt')
-    test_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'test.txt')
+        print(labels_set)
+        print(label2id)
+        print(id2label)
 
-    # Data loaders
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn)
+        tokenizer = BertTokenizer.from_pretrained('bert/tokenizer_config.json')
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((224, 224)),
+            torchvision.transforms.ToTensor(),
+        ])
 
-    label2id = {
-        'O': 0,
-        'B-LOC': 1, 'I-LOC': 2,
-        'B-PER': 3, 'I-PER': 4,
-        'B-ORG': 5, 'I-ORG': 6
-    }
-    id2label = {v: k for k, v in label2id.items()}
+        train_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'train.txt', label2id, id2label)
+        val_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'valid.txt', label2id, id2label)
+        test_dataset = TwitterDataset(data_folder, img_folder, tokenizer, transform, 'test.txt', label2id, id2label)
 
-    config = BertConfig.from_pretrained('bert-base-uncased', num_labels=7)
-    config.label2id = label2id
-    config.id2label = id2label
-    model = MTCCMBertForMMTokenClassificationCRF(config=config, num_labels=7, add_context_aware_gate=True,
-                                                 use_dynamic_cross_modal_fusion=True)
+        # Data loaders
+        train_loader = DataLoader(train_dataset, batch_size=12, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
 
-    #  num_training_steps=len(train_loader) * 10
-    optimizer = Adam(model.parameters(), lr=5e-5)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
-                                                num_training_steps=10)
+        config = BertConfig.from_pretrained('bert/', num_labels=len(label2id.items()))
+        config.label2id = label2id
+        config.id2label = id2label
+        if model_type == "model_with_all":
+            model = MTCCMBertForMMTokenClassificationCRF(config=config, num_labels=len(label2id.items()),
+                                                         add_context_aware_gate=True,
+                                                         use_dynamic_cross_modal_fusion=True)
+        elif model_type == "model_with_gate":
+            model = MTCCMBertForMMTokenClassificationCRF(config=config, num_labels=len(label2id.items()),
+                                                         add_context_aware_gate=True,
+                                                         use_dynamic_cross_modal_fusion=False)
 
-    train_model(model, train_loader, val_loader, optimizer, scheduler, num_epochs=2)
+        elif model_type == "model_with_attention":
+            model = MTCCMBertForMMTokenClassificationCRF(config=config, num_labels=len(label2id.items()),
+                                                         add_context_aware_gate=False,
+                                                         use_dynamic_cross_modal_fusion=True)
+
+        else:
+            model = MTCCMBertForMMTokenClassificationCRF(config=config, num_labels=len(label2id.items()),
+                                                         add_context_aware_gate=False,
+                                                         use_dynamic_cross_modal_fusion=False)
+        optimizer = Adam(model.parameters(), lr=5e-5)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
+                                                    num_training_steps=len(train_loader) * 10)
+
+        best_f1 = 0.0
+        model.to(device)
+        num_epochs = 12
+
+        for epoch in range(num_epochs):
+            print("Training for epoch ", str(epoch))
+            model.train()
+            total_loss = 0
+            train_progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False)
+
+            for inputs, masks, images, labels in train_progress_bar:
+                optimizer.zero_grad()
+                loss = model(inputs.to(device), masks.to(device), images.to(device), labels.to(device))
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+
+            avg_train_loss = total_loss / len(train_loader)
+            val_loss, val_f1 = evaluate_model(model, val_loader)
+
+            print(
+                f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss}, Val Loss: {val_loss}, Val F1: {val_f1}")
+
+            # Save the model if the validation F1 score is the best we've seen so far.
+            save_path = "output3/" + model_type + "/epoch_" + str(epoch + 1) + "_valf1_" + str(val_f1)
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+
+            save_path = save_path + "/model.pth"
+            torch.save(model.state_dict(), save_path)
+            print("Saved best model")
+
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                print("Validation improved: ", str(best_f1))
+
+        gc.collect()
+
+    # train_model(model, train_loader, val_loader, optimizer, scheduler, num_epochs=10)
 
 
 if __name__ == "__main__":

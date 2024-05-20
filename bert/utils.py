@@ -53,3 +53,4 @@ class DynamicAttentionModule(nn.Module):
         attended_text = text_features * text_weights
         attended_visuals = visual_features * visual_weights
         return attended_text, attended_visuals
+
